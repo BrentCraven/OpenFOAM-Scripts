@@ -1,179 +1,168 @@
 #!/usr/bin/env python3
 
 """
-plot_steady_residuals.py: Parse OpenFOAM log file from simpleFoam and plot residuals for Ux, Uy, Uz (if present), and p
+plot_steady_residuals.py logfile: Parse OpenFOAM log file ('logfile') from simpleFoam and plot residuals
+
+options:
+  -h, --help           show this help message and exit
+  --out OUT            Output image path
+  --csv CSV            Optional CSV export path
+  --watch              Watch the log file and update the plot in real-time
+  --interval INTERVAL  Refresh interval in seconds for --watch (default: 1)
 
 USAGE:
   # Make executable
   chmod +x plot_steady_residuals.py
 
-  # Show plot interactively (no file written)
-  ./plot_steady_residuals.py log.simpleFoam
+  # Show plot interactively and update in real-time (no file written)
+  ./plot_steady_residuals.py log.simpleFoam --watch
 
   # Save plot to file with no interactive plot (format inferred from extension)
   ./plot_steady_residuals.py log.simpleFoam --out residuals.png
   ./plot_steady_residuals.py log.simpleFoam --out residuals.pdf
   ./plot_steady_residuals.py log.simpleFoam --out residuals.svg
 
-  # Optional CSV export (columns: Time, Ux residual, Uy residual, Uz residual (if present), p residual)
+  # Optional CSV export of residuals
   ./plot_steady_residuals.py log.simpleFoam --out residuals.png --csv residuals.csv
 
 NOTES:
   - Y-axis is logarithmic; non-positives are masked to NaN to avoid log errors.
 """
 
-import argparse  # Parse command-line arguments
-import re        # Regular expressions for parsing log lines
-import math      # Provides math.nan and numeric checks
-import sys       # For clean process termination with messages
-from typing import List, Tuple, Optional  # Type hints for clarity
+import argparse
+import re
+import math
+import sys
+import csv
+import time
+from typing import List, Tuple, Optional, Dict
 
-import matplotlib.pyplot as plt  # Plotting backend (save/show figures)
+import matplotlib.pyplot as plt
 
+def parse_log(log_path: str) -> Tuple[List[Dict], List[str]]:
+    """Parse OpenFOAM log for all residuals and return (rows, found_keys)."""
+    res_re = re.compile(r'Solving\s+for\s+(?P<var>\w+),\s*Initial\s+residual\s*=\s*(?P<val>[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)')
+    time_re = re.compile(r'^\s*Time\s*=\s*(?P<time>[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*$')
+    end_re  = re.compile(r'^\s*ExecutionTime\b')
 
-def parse_log(log_path: str) -> Tuple[List[Tuple[float, float, float, float, float]], bool]:
-    """Return (rows, has_uz) where rows are (time, Ux, Uy, p, Uz)."""  # Describe output schema
-    time_re = re.compile(r'^\s*Time\s*=\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*$')  # Match 'Time = <num>'
-    ux_re   = re.compile(r'Solving\s+for\s+Ux,\s*Initial\s+residual\s*=\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)')  # Ux initial
-    uy_re   = re.compile(r'Solving\s+for\s+Uy,\s*Initial\s+residual\s*=\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)')  # Uy initial
-    uz_re   = re.compile(r'Solving\s+for\s+Uz,\s*Initial\s+residual\s*=\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)')  # Uz initial
-    p_re    = re.compile(r'Solving\s+for\s+p,\s*Initial\s+residual\s*=\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)')   # p  initial
-    end_re  = re.compile(r'^\s*ExecutionTime\b')  # Block terminator line in OpenFOAM logs
+    rows = []
+    current_row = {}
+    found_keys = set()
 
-    current_time = None        # Active block time marker
-    ux_init = math.nan         # Ux initial residual accumulator for block
-    uy_init = math.nan         # Uy initial residual accumulator for block
-    uz_init = math.nan         # Uz initial residual accumulator for block
-    p_init  = math.nan         # p  initial residual accumulator for block
+    try:
+        with open(log_path, 'r', encoding='utf-8', errors='replace') as fh:
+            for line in fh:
+                m_time = time_re.search(line)
+                if m_time:
+                    if current_row and 'Time' in current_row:
+                        rows.append(current_row)
+                    current_row = {'Time': float(m_time.group('time'))}
+                    continue
 
-    has_uz = False             # Whether Uz appears in any block
-    rows: List[Tuple[float, float, float, float, float]] = []  # Accumulator of (time, Ux, Uy, p, Uz)
+                m_res = res_re.search(line)
+                if m_res:
+                    var = m_res.group('var')
+                    if var not in current_row:
+                        val = float(m_res.group('val'))
+                        current_row[var] = val
+                        found_keys.add(var)
+                    continue
 
-    with open(log_path, 'r', encoding='utf-8', errors='replace') as fh:  # Stream file to handle large logs
-        for line in fh:  # Iterate lines
-            m_time = time_re.search(line)  # Detect 'Time = ...'
-            if m_time:  # Start of a new block
-                if current_time is not None:  # Flush previous block if open
-                    rows.append((current_time, ux_init, uy_init, p_init, uz_init))  # Append row
-                current_time = float(m_time.group(1))  # Set time for new block
-                ux_init = uy_init = uz_init = p_init = math.nan  # Reset block accumulators
-                continue  # Next line
+                if end_re.search(line):
+                    if current_row and 'Time' in current_row:
+                        rows.append(current_row)
+                    current_row = {}
 
-            if current_time is not None:  # Only parse residuals within a time block
-                if math.isnan(ux_init):  # Capture first Ux initial residual in this block
-                    m_ux = ux_re.search(line)  # Try matching Ux
-                    if m_ux:
-                        ux_init = float(m_ux.group(1))  # Store Ux initial residual
-                        continue  # Next line
+        if current_row and 'Time' in current_row:
+            rows.append(current_row)
+    except FileNotFoundError:
+        return [], []
 
-                if math.isnan(uy_init):  # Capture first Uy initial residual in this block
-                    m_uy = uy_re.search(line)  # Try matching Uy
-                    if m_uy:
-                        uy_init = float(m_uy.group(1))  # Store Uy initial residual
-                        continue  # Next line
+    rows.sort(key=lambda r: r['Time'])
+    
+    priority = ['Ux', 'Uy', 'Uz', 'p', 'k', 'omega', 'epsilon', 'nut', 'nuTilda']
+    sorted_keys = [k for k in priority if k in found_keys]
+    sorted_keys += sorted([k for k in found_keys if k not in priority])
+    
+    return rows, sorted_keys
 
-                if math.isnan(uz_init):  # Capture first Uz initial residual in this block
-                    m_uz = uz_re.search(line)  # Try matching Uz
-                    if m_uz:
-                        uz_init = float(m_uz.group(1))  # Store Uz initial residual
-                        has_uz = True  # Flag presence of Uz in the log
-                        continue  # Next line
-
-                if math.isnan(p_init):  # Capture first p initial residual in this block
-                    m_p = p_re.search(line)  # Try matching p
-                    if m_p:
-                        p_init = float(m_p.group(1))  # Store p initial residual
-                        continue  # Next line
-
-                if end_re.search(line):  # End-of-block marker
-                    rows.append((current_time, ux_init, uy_init, p_init, uz_init))  # Append row
-                    current_time = None  # Clear block state
-                    ux_init = uy_init = uz_init = p_init = math.nan  # Reset accumulators
-                    continue  # Next line
-
-    if current_time is not None:  # Flush trailing block missing ExecutionTime
-        rows.append((current_time, ux_init, uy_init, p_init, uz_init))  # Append last row
-
-    rows.sort(key=lambda r: r[0])  # Sort rows by time ascending
-    return rows, has_uz  # Return the parsed table and Uz presence flag
-
-
-def write_csv(rows: List[Tuple[float, float, float, float, float]], csv_path: str, has_uz: bool) -> None:
-    """Write CSV with columns: Time, Ux residual, Uy residual, [Uz residual], p residual (order enforced)."""  # CSV schema
-    import csv  # Lazy import for CSV I/O
-    with open(csv_path, 'w', newline='', encoding='utf-8') as fh:  # Open destination CSV
-        w = csv.writer(fh)  # CSV writer
-        header = ['Time', 'Ux residual', 'Uy residual']  # Start header with Ux, Uy
-        if has_uz:  # Include Uz if present
-            header.append('Uz residual')  # Add Uz column
-        header.append('p residual')  # p always last
-        w.writerow(header)  # Write header row
-        for t, ux, uy, p, uz in rows:  # Iterate parsed rows
-            if has_uz:  # Five-field case
-                w.writerow([t, ux, uy, uz, p])  # Order: Ux, Uy, Uz, p
-            else:  # Four-field case
-                w.writerow([t, ux, uy, p])  # Order: Ux, Uy, p
-
+def write_csv(rows: List[Dict], keys: List[str], csv_path: str) -> None:
+    """Write CSV with Time and all detected residual columns."""
+    with open(csv_path, 'w', newline='', encoding='utf-8') as fh:
+        writer = csv.DictWriter(fh, fieldnames=['Time'] + keys)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
 
 def mask_nonpositive(series: List[float]) -> List[float]:
-    """Map v<=0 to NaN for log-scale safety."""  # Explain masking
-    return [v if (isinstance(v, (float, int)) and v > 0.0) else math.nan for v in series]  # Replace non-positives
+    return [v if (v is not None and v > 0.0) else math.nan for v in series]
 
+def update_plot(ax, rows, keys):
+    """Refreshes the data on the provided axes."""
+    ax.clear()
+    ax.set_yscale('log')
+    
+    if not rows:
+        return
 
-def plot(rows: List[Tuple[float, float, float, float, float]], out_path: Optional[str], has_uz: bool) -> None:
-    """Plot residuals in order Ux, Uy, Uz?, p; bold axis labels; save or show."""  # Plot behavior
-    if not rows:  # Guard against empty input
-        sys.exit("No residual records found in the log.")  # Abort with message
+    times = [r['Time'] for r in rows]
+    for var in keys:
+        data = [r.get(var) for r in rows]
+        masked_data = mask_nonpositive(data)
+        
+        lw = 2.0 if var in ['p', 'Ux', 'Uy', 'Uz'] else 1.5
+        ax.plot(times, masked_data, label=var, linewidth=lw, linestyle='-')
 
-    times = [r[0] for r in rows]  # X-axis values (time)
-    ux    = [r[1] for r in rows]  # Ux series
-    uy    = [r[2] for r in rows]  # Uy series
-    p     = [r[3] for r in rows]  # p series
-    uz    = [r[4] for r in rows]  # Uz series (may be all-NaN)
-
-    ux_m = mask_nonpositive(ux)  # Mask non-positives for log-scale
-    uy_m = mask_nonpositive(uy)  # Mask non-positives for log-scale
-    uz_m = mask_nonpositive(uz) if has_uz else None  # Mask Uz if present
-    p_m  = mask_nonpositive(p)   # Mask non-positives for log-scale
-
-    fig, ax = plt.subplots(figsize=(10, 5.5), constrained_layout=True)  # Figure with tight layout
-    ax.set_yscale('log')  # Logarithmic Y-axis to visualize decades
-
-    # All lines use linestyle='-' as requested
-    ax.plot(times, ux_m, label='Ux', linewidth=2.0, linestyle='-')  # Ux (solid)
-    ax.plot(times, uy_m, label='Uy', linewidth=2.0, linestyle='-')  # Uy (solid)
-    if has_uz:  # Conditionally include Uz
-        ax.plot(times, uz_m, label='Uz', linewidth=2.0, linestyle='-')  # Uz (solid)
-    ax.plot(times, p_m,  label='p',  linewidth=2.0, linestyle='-')  # p (solid)
-
-    tmax = max(t for t in times if isinstance(t, (int, float)))
-    ax.set_xlim(0, tmax)  # x range [0, tmax]
-
-    ax.set_xlabel('Time', fontweight='bold')               # Bold X-axis label
-    ax.set_ylabel('Residual', fontweight='bold')   # Bold Y-axis label
-    ax.grid(True, which='both', alpha=0.3)                 # Light grid on major/minor ticks
-    ax.legend(loc='upper right', frameon=True)             # Legend placement and frame
-
-    if out_path:  # Save if output path provided
-        fig.savefig(out_path, dpi=200)  # Save figure; format inferred by extension
-    else:  # Otherwise show interactively
-        plt.show()  # Open GUI window
-
+    ax.set_xlim(0, max(times))
+    ax.set_xlabel('Iteration', fontweight='bold')
+    ax.set_ylabel('Residual', fontweight='bold')
+    ax.grid(True, which='both', alpha=0.3)
+    ax.legend(loc='upper right', frameon=True, ncol=2)
+    plt.title(f"Residuals", fontweight='bold')
 
 def main() -> None:
-    """CLI: parse args, parse log, optional CSV, then plot (save or show)."""  # Entry point description
-    ap = argparse.ArgumentParser(description="Parse OpenFOAM log and plot initial residuals for Ux, Uy, Uz (if present), and p.")  # CLI parser
-    ap.add_argument('logfile', help="Path to OpenFOAM-style log.simpleFoam (e.g., log.simpleFoam)")  # Positional logfile path
-    ap.add_argument('--out', default=None, help="Output image path (.png/.pdf/.svg). If omitted, shows interactively.")  # Optional output
-    ap.add_argument('--csv', default=None, help="Optional CSV export path (columns: Time, Ux, Uy, [Uz], p)")  # Optional CSV path
-    args = ap.parse_args()  # Parse arguments
+    ap = argparse.ArgumentParser(description="Parse OpenFOAM log and plot residuals.")
+    ap.add_argument('logfile', help="Path to OpenFOAM log file")
+    ap.add_argument('--out', default=None, help="Output image path.")
+    ap.add_argument('--csv', default=None, help="Optional CSV export path.")
+    ap.add_argument('--watch', action='store_true', help="Watch the log file and update the plot in real-time.")
+    ap.add_argument('--interval', type=int, default=1, help="Refresh interval in seconds for --watch (default: 1).")
+    args = ap.parse_args()
 
-    rows, has_uz = parse_log(args.logfile)  # Parse the log and detect Uz presence
-    if args.csv:  # CSV export requested
-        write_csv(rows, args.csv, has_uz)  # Write CSV file
-    plot(rows, args.out, has_uz)  # Render plot and either save or show
+    if args.watch:
+        plt.ion() # Enable interactive mode
+        fig, ax = plt.subplots(figsize=(10, 5.5), constrained_layout=True)
+        
+        print(f"Watching {args.logfile}. Press Ctrl+C to stop.")
+        try:
+            while True:
+                rows, keys = parse_log(args.logfile)
+                if rows:
+                    update_plot(ax, rows, keys)
+                    plt.draw()
+                    plt.pause(args.interval)
+                    if args.csv:
+                        write_csv(rows, keys, args.csv)
+                else:
+                    print("Waiting for data...")
+                    time.sleep(args.interval)
+        except KeyboardInterrupt:
+            print("\nWatch stopped by user.")
+            if args.out:
+                fig.savefig(args.out, dpi=200)
+    else:
+        # Standard one-time execution
+        rows, keys = parse_log(args.logfile)
+        if args.csv:
+            write_csv(rows, keys, args.csv)
+        
+        fig, ax = plt.subplots(figsize=(10, 5.5), constrained_layout=True)
+        update_plot(ax, rows, keys)
+        
+        if args.out:
+            fig.savefig(args.out, dpi=200)
+        else:
+            plt.show()
 
-
-if __name__ == '__main__':  # Script entry guard
-    main()  # Execute CLI workflow
-
+if __name__ == '__main__':
+    main()
